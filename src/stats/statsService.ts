@@ -21,16 +21,18 @@ export interface KeyStats {
 }
 
 export async function deleteOldRequests(): Promise<number> {
-  const cutoff = new Date(Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  const cutoffIso = new Date(Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
   return prisma.$transaction(async (tx) => {
-    // Aggregate expiring requests into daily buckets (kept forever)
+    // Aggregate expiring requests into daily buckets (kept forever).
+    // Use substr on the stored ISO string rather than datetime() to avoid
+    // SQLite parsing issues with how Prisma serializes Date objects.
     const aggregates = await tx.$queryRaw<
       { apiKeyId: number; date: string; count: bigint }[]
     >`
-      SELECT apiKeyId, strftime('%Y-%m-%d', datetime(createdAt)) as date, COUNT(*) as count
+      SELECT apiKeyId, substr(createdAt, 1, 10) as date, COUNT(*) as count
       FROM ApiKeyRequest
-      WHERE createdAt < ${cutoff}
+      WHERE createdAt < ${cutoffIso}
       GROUP BY apiKeyId, date
     `;
 
@@ -49,7 +51,7 @@ export async function deleteOldRequests(): Promise<number> {
     }
 
     const result = await tx.apiKeyRequest.deleteMany({
-      where: { createdAt: { lt: cutoff } },
+      where: { createdAt: { lt: cutoffIso } },
     });
     return result.count;
   });
@@ -87,11 +89,11 @@ async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
   });
   if (!apiKey) return null;
 
-  const cutoff = new Date(Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  const cutoffIso = new Date(Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
   const rows = await prisma.$queryRaw<{ hour: string; count: bigint }[]>`
-    SELECT strftime('%Y-%m-%dT%H:00:00.000Z', datetime(createdAt)) as hour, COUNT(*) as count
+    SELECT substr(createdAt, 1, 13) || ':00:00.000Z' as hour, COUNT(*) as count
     FROM ApiKeyRequest
-    WHERE apiKeyId = ${keyId} AND createdAt >= ${cutoff}
+    WHERE apiKeyId = ${keyId} AND createdAt >= ${cutoffIso}
     GROUP BY hour
     ORDER BY hour
   `;
@@ -113,7 +115,7 @@ async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
   }
 
   const recentCount = await prisma.apiKeyRequest.count({
-    where: { apiKeyId: keyId, createdAt: { gte: cutoff } },
+    where: { apiKeyId: keyId, createdAt: { gte: cutoffIso } },
   });
 
   const dailyRows = await prisma.apiKeyUsageDaily.findMany({
