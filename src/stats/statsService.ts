@@ -5,16 +5,19 @@ const STATS_RETENTION_DAYS = 2;
 export interface HourlyBucket {
   hour: string;
   count: number;
+  totalTokens: number;
 }
 
 export interface DailyBucket {
   date: string; // YYYY-MM-DD
   count: number;
+  totalTokens: number;
 }
 
 export interface KeyStats {
   keyId: number;
   totalRequests: number;
+  totalTokens: number;
   lastUsedAt: Date | null;
   hourly: HourlyBucket[];
   daily: DailyBucket[];
@@ -24,13 +27,10 @@ export async function deleteOldRequests(): Promise<number> {
   const cutoffIso = new Date(Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
   return prisma.$transaction(async (tx) => {
-    // Aggregate expiring requests into daily buckets (kept forever).
-    // Use substr on the stored ISO string rather than datetime() to avoid
-    // SQLite parsing issues with how Prisma serializes Date objects.
     const aggregates = await tx.$queryRaw<
-      { apiKeyId: number; date: string; count: bigint }[]
+      { apiKeyId: number; date: string; count: bigint; totalTokens: bigint }[]
     >`
-      SELECT apiKeyId, substr(createdAt, 1, 10) as date, COUNT(*) as count
+      SELECT apiKeyId, substr(createdAt, 1, 10) as date, COUNT(*) as count, COALESCE(SUM(totalTokens), 0) as totalTokens
       FROM ApiKeyRequest
       WHERE createdAt < ${cutoffIso}
       GROUP BY apiKeyId, date
@@ -45,8 +45,12 @@ export async function deleteOldRequests(): Promise<number> {
           apiKeyId: row.apiKeyId,
           date: row.date,
           count: Number(row.count),
+          totalTokens: Number(row.totalTokens),
         },
-        update: { count: { increment: Number(row.count) } },
+        update: {
+          count: { increment: Number(row.count) },
+          totalTokens: { increment: Number(row.totalTokens) },
+        },
       });
     }
 
@@ -90,8 +94,13 @@ async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
   if (!apiKey) return null;
 
   const cutoffIso = new Date(Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
-  const rows = await prisma.$queryRaw<{ hour: string; count: bigint }[]>`
-    SELECT substr(createdAt, 1, 13) || ':00:00.000Z' as hour, COUNT(*) as count
+
+  const rows = await prisma.$queryRaw<
+    { hour: string; count: bigint; totalTokens: bigint }[]
+  >`
+    SELECT substr(createdAt, 1, 13) || ':00:00.000Z' as hour,
+           COUNT(*) as count,
+           COALESCE(SUM(totalTokens), 0) as totalTokens
     FROM ApiKeyRequest
     WHERE apiKeyId = ${keyId} AND createdAt >= ${cutoffIso}
     GROUP BY hour
@@ -99,7 +108,7 @@ async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
   `;
 
   const hourlyMap = new Map(
-    rows.map((r) => [r.hour, Number(r.count)])
+    rows.map((r) => [r.hour, { count: Number(r.count), totalTokens: Number(r.totalTokens) }])
   );
 
   const hourly: HourlyBucket[] = [];
@@ -108,14 +117,18 @@ async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
     const h = new Date(now.getTime() - (47 - i) * 60 * 60 * 1000);
     h.setMinutes(0, 0, 0);
     const hourStr = h.toISOString();
+    const bucket = hourlyMap.get(hourStr);
     hourly.push({
       hour: hourStr,
-      count: hourlyMap.get(hourStr) ?? 0,
+      count: bucket?.count ?? 0,
+      totalTokens: bucket?.totalTokens ?? 0,
     });
   }
 
-  const recentCount = await prisma.apiKeyRequest.count({
+  const recentAgg = await prisma.apiKeyRequest.aggregate({
     where: { apiKeyId: keyId, createdAt: { gte: cutoffIso } },
+    _count: true,
+    _sum: { totalTokens: true },
   });
 
   const dailyRows = await prisma.apiKeyUsageDaily.findMany({
@@ -126,14 +139,18 @@ async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
   const daily: DailyBucket[] = dailyRows.map((r) => ({
     date: r.date,
     count: r.count,
+    totalTokens: r.totalTokens,
   }));
 
-  const historicalTotal = dailyRows.reduce((sum, r) => sum + r.count, 0);
-  const totalRequests = historicalTotal + recentCount;
+  const historicalRequests = dailyRows.reduce((sum, r) => sum + r.count, 0);
+  const historicalTokens = dailyRows.reduce((sum, r) => sum + r.totalTokens, 0);
+  const totalRequests = historicalRequests + recentAgg._count;
+  const totalTokens = historicalTokens + (recentAgg._sum.totalTokens ?? 0);
 
   return {
     keyId: apiKey.id,
     totalRequests,
+    totalTokens,
     lastUsedAt: apiKey.lastUsedAt,
     hourly,
     daily,

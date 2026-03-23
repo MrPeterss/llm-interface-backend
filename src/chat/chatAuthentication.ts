@@ -24,15 +24,44 @@ export async function validateApiKey(
     }
 
     const now = new Date();
-    await Promise.all([
-      prisma.apiKey.update({
-        where: { id: key.id },
-        data: { lastUsedAt: now },
-      }),
-      prisma.apiKeyRequest.create({
-        data: { apiKeyId: key.id, createdAt: now },
-      }),
-    ]);
+
+    if (key.limitTokensPerMinute !== null) {
+      const oneMinuteAgo = new Date(now.getTime() - 60 * 1000).toISOString();
+      const result = await prisma.apiKeyRequest.aggregate({
+        where: { apiKeyId: key.id, createdAt: { gte: oneMinuteAgo } },
+        _sum: { totalTokens: true },
+      });
+      const tokensLastMinute = result._sum.totalTokens ?? 0;
+      if (tokensLastMinute >= key.limitTokensPerMinute) {
+        return res.status(429).json({
+          error: 'Rate limit exceeded',
+          detail: `Token limit of ${key.limitTokensPerMinute} per minute reached (used ${tokensLastMinute})`,
+        });
+      }
+    }
+
+    if (key.limitTokensPerHour !== null) {
+      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
+      const result = await prisma.apiKeyRequest.aggregate({
+        where: { apiKeyId: key.id, createdAt: { gte: oneHourAgo } },
+        _sum: { totalTokens: true },
+      });
+      const tokensLastHour = result._sum.totalTokens ?? 0;
+      if (tokensLastHour >= key.limitTokensPerHour) {
+        return res.status(429).json({
+          error: 'Rate limit exceeded',
+          detail: `Token limit of ${key.limitTokensPerHour} per hour reached (used ${tokensLastHour})`,
+        });
+      }
+    }
+
+    // Pass keyId to controller for post-response request logging
+    res.locals.apiKeyId = key.id;
+
+    await prisma.apiKey.update({
+      where: { id: key.id },
+      data: { lastUsedAt: now },
+    });
 
     return next();
   } catch (error) {
