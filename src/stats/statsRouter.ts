@@ -8,7 +8,9 @@ const router = Router();
 router.use(validateIpAllowlist);
 router.use(validateServerSecret);
 
-router.get('/', statsController.getKeysStats);
-router.get('/:keyId', statsController.getKeyStats);
+// GET /stats?key=<keystring>          - single key
+// GET /stats/batch?keys=<k1>,<k2>     - multiple keys
+router.get('/', statsController.getKeyStats);
+router.get('/batch', statsController.getKeysStats);
 
 export { router as statsRouter };

@@ -55,22 +55,32 @@ export async function deleteOldRequests(): Promise<number> {
   });
 }
 
-export async function getKeyStats(keyId: number): Promise<KeyStats | null> {
+export async function getKeyStatsByKey(keyString: string): Promise<KeyStats | null> {
   await deleteOldRequests();
-  return getKeyStatsForKey(keyId);
+  const apiKey = await prisma.apiKey.findUnique({
+    where: { key: keyString },
+    select: { id: true },
+  });
+  if (!apiKey) return null;
+  return getKeyStatsForId(apiKey.id);
 }
 
-export async function getKeysStats(keyIds: number[]): Promise<KeyStats[]> {
+export async function getKeysStatsByKeys(keyStrings: string[]): Promise<KeyStats[]> {
   await deleteOldRequests();
   const stats: KeyStats[] = [];
-  for (const keyId of keyIds) {
-    const s = await getKeyStatsForKey(keyId);
+  for (const keyString of keyStrings) {
+    const apiKey = await prisma.apiKey.findUnique({
+      where: { key: keyString },
+      select: { id: true },
+    });
+    if (!apiKey) continue;
+    const s = await getKeyStatsForId(apiKey.id);
     if (s) stats.push(s);
   }
   return stats;
 }
 
-async function getKeyStatsForKey(keyId: number): Promise<KeyStats | null> {
+async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
   const apiKey = await prisma.apiKey.findUnique({
     where: { id: keyId },
     select: { id: true, lastUsedAt: true },
