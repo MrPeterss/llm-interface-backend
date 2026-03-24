@@ -98,7 +98,6 @@ async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
   if (!apiKey) return null;
 
   const cutoffMs = Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000;
-  const cutoffDate = new Date(cutoffMs);
 
   const rows = await prisma.$queryRaw<
     { hour: string; count: bigint; totalTokens: bigint }[]
@@ -130,27 +129,48 @@ async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
     });
   }
 
-  const recentAgg = await prisma.apiKeyRequest.aggregate({
-    where: { apiKeyId: keyId, createdAt: { gte: cutoffDate } },
-    _count: true,
-    _sum: { totalTokens: true },
-  });
+  // Aggregate recent requests (within retention window) by day
+  const recentDailyRows = await prisma.$queryRaw<
+    { date: string; count: bigint; totalTokens: bigint }[]
+  >`
+    SELECT strftime('%Y-%m-%d', createdAt / 1000, 'unixepoch') as date,
+           COUNT(*) as count,
+           COALESCE(SUM(totalTokens), 0) as totalTokens
+    FROM ApiKeyRequest
+    WHERE apiKeyId = ${keyId} AND createdAt >= ${cutoffMs}
+    GROUP BY date
+    ORDER BY date
+  `;
 
-  const dailyRows = await prisma.apiKeyUsageDaily.findMany({
+  // Historical aggregated daily records (older than retention window)
+  const historicalDailyRows = await prisma.apiKeyUsageDaily.findMany({
     where: { apiKeyId: keyId },
     orderBy: { date: 'asc' },
   });
 
-  const daily: DailyBucket[] = dailyRows.map((r) => ({
-    date: r.date,
-    count: r.count,
-    totalTokens: r.totalTokens,
-  }));
+  // Merge: historical rows first, then recent rows (keyed by date to avoid duplicates)
+  const dailyMap = new Map<string, { count: number; totalTokens: number }>();
+  for (const r of historicalDailyRows) {
+    dailyMap.set(r.date, { count: r.count, totalTokens: r.totalTokens });
+  }
+  for (const r of recentDailyRows) {
+    const existing = dailyMap.get(r.date);
+    if (existing) {
+      dailyMap.set(r.date, {
+        count: existing.count + Number(r.count),
+        totalTokens: existing.totalTokens + Number(r.totalTokens),
+      });
+    } else {
+      dailyMap.set(r.date, { count: Number(r.count), totalTokens: Number(r.totalTokens) });
+    }
+  }
 
-  const historicalRequests = dailyRows.reduce((sum, r) => sum + r.count, 0);
-  const historicalTokens = dailyRows.reduce((sum, r) => sum + r.totalTokens, 0);
-  const totalRequests = historicalRequests + recentAgg._count;
-  const totalTokens = historicalTokens + (recentAgg._sum.totalTokens ?? 0);
+  const daily: DailyBucket[] = Array.from(dailyMap.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, { count, totalTokens }]) => ({ date, count, totalTokens }));
+
+  const totalRequests = daily.reduce((sum, r) => sum + r.count, 0);
+  const totalTokens = daily.reduce((sum, r) => sum + r.totalTokens, 0);
 
   return {
     keyId: apiKey.id,
