@@ -24,15 +24,19 @@ export interface KeyStats {
 }
 
 export async function deleteOldRequests(): Promise<number> {
-  const cutoffIso = new Date(Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const cutoffMs = Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const cutoffDate = new Date(cutoffMs);
 
   return prisma.$transaction(async (tx) => {
     const aggregates = await tx.$queryRaw<
       { apiKeyId: number; date: string; count: bigint; totalTokens: bigint }[]
     >`
-      SELECT apiKeyId, substr(createdAt, 1, 10) as date, COUNT(*) as count, COALESCE(SUM(totalTokens), 0) as totalTokens
+      SELECT apiKeyId,
+             strftime('%Y-%m-%d', createdAt / 1000, 'unixepoch') as date,
+             COUNT(*) as count,
+             COALESCE(SUM(totalTokens), 0) as totalTokens
       FROM ApiKeyRequest
-      WHERE createdAt < ${cutoffIso}
+      WHERE createdAt < ${cutoffMs}
       GROUP BY apiKeyId, date
     `;
 
@@ -55,7 +59,7 @@ export async function deleteOldRequests(): Promise<number> {
     }
 
     const result = await tx.apiKeyRequest.deleteMany({
-      where: { createdAt: { lt: cutoffIso } },
+      where: { createdAt: { lt: cutoffDate } },
     });
     return result.count;
   });
@@ -93,16 +97,17 @@ async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
   });
   if (!apiKey) return null;
 
-  const cutoffIso = new Date(Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const cutoffMs = Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const cutoffDate = new Date(cutoffMs);
 
   const rows = await prisma.$queryRaw<
     { hour: string; count: bigint; totalTokens: bigint }[]
   >`
-    SELECT substr(createdAt, 1, 13) || ':00:00.000Z' as hour,
+    SELECT strftime('%Y-%m-%dT%H:00:00.000Z', createdAt / 1000, 'unixepoch') as hour,
            COUNT(*) as count,
            COALESCE(SUM(totalTokens), 0) as totalTokens
     FROM ApiKeyRequest
-    WHERE apiKeyId = ${keyId} AND createdAt >= ${cutoffIso}
+    WHERE apiKeyId = ${keyId} AND createdAt >= ${cutoffMs}
     GROUP BY hour
     ORDER BY hour
   `;
@@ -126,7 +131,7 @@ async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
   }
 
   const recentAgg = await prisma.apiKeyRequest.aggregate({
-    where: { apiKeyId: keyId, createdAt: { gte: cutoffIso } },
+    where: { apiKeyId: keyId, createdAt: { gte: cutoffDate } },
     _count: true,
     _sum: { totalTokens: true },
   });

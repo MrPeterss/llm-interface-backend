@@ -26,7 +26,7 @@ export async function validateApiKey(
     const now = new Date();
 
     if (key.limitTokensPerMinute !== null) {
-      const oneMinuteAgo = new Date(now.getTime() - 60 * 1000).toISOString();
+      const oneMinuteAgo = new Date(now.getTime() - 60 * 1000);
       const result = await prisma.apiKeyRequest.aggregate({
         where: { apiKeyId: key.id, createdAt: { gte: oneMinuteAgo } },
         _sum: { totalTokens: true },
@@ -41,7 +41,7 @@ export async function validateApiKey(
     }
 
     if (key.limitTokensPerHour !== null) {
-      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
+      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
       const result = await prisma.apiKeyRequest.aggregate({
         where: { apiKeyId: key.id, createdAt: { gte: oneHourAgo } },
         _sum: { totalTokens: true },

@@ -29,7 +29,7 @@ async function logRequest(apiKeyId: number, totalTokens: number | null): Promise
     await prisma.apiKeyRequest.create({
       data: {
         apiKeyId,
-        createdAt: new Date().toISOString(),
+        createdAt: new Date(),
         totalTokens,
       },
     });
