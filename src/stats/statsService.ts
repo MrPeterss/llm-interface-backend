@@ -43,12 +43,12 @@ export async function deleteOldRequests(): Promise<number> {
       { apiKeyId: number; date: string; count: bigint; totalTokens: bigint }[]
     >`
       SELECT apiKeyId,
-             strftime('%Y-%m-%d', createdAt / 1000, 'unixepoch') as date,
+             strftime('%Y-%m-%d', r.createdAt / 1000, 'unixepoch') as date,
              COUNT(*) as count,
              COALESCE(SUM(totalTokens), 0) as totalTokens
       FROM ApiKeyRequest r
       INNER JOIN ApiKey k ON k.id = r.apiKeyId
-      WHERE createdAt < ${cutoffMs}
+      WHERE r.createdAt < ${cutoffMs}
       GROUP BY apiKeyId, date
     `;
 
