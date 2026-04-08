@@ -28,6 +28,17 @@ export async function deleteOldRequests(): Promise<number> {
   const cutoffDate = new Date(cutoffMs);
 
   return prisma.$transaction(async (tx) => {
+    // Defensive cleanup: if SQLite foreign keys were ever disabled, we can end up
+    // with orphaned request/usage rows that will fail FK checks during aggregation.
+    await tx.$executeRaw`
+      DELETE FROM ApiKeyRequest
+      WHERE apiKeyId NOT IN (SELECT id FROM ApiKey)
+    `;
+    await tx.$executeRaw`
+      DELETE FROM ApiKeyUsageDaily
+      WHERE apiKeyId NOT IN (SELECT id FROM ApiKey)
+    `;
+
     const aggregates = await tx.$queryRaw<
       { apiKeyId: number; date: string; count: bigint; totalTokens: bigint }[]
     >`
@@ -35,7 +46,8 @@ export async function deleteOldRequests(): Promise<number> {
              strftime('%Y-%m-%d', createdAt / 1000, 'unixepoch') as date,
              COUNT(*) as count,
              COALESCE(SUM(totalTokens), 0) as totalTokens
-      FROM ApiKeyRequest
+      FROM ApiKeyRequest r
+      INNER JOIN ApiKey k ON k.id = r.apiKeyId
       WHERE createdAt < ${cutoffMs}
       GROUP BY apiKeyId, date
     `;
