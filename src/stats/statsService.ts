@@ -1,6 +1,8 @@
+import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma.js';
 
 const STATS_RETENTION_DAYS = 2;
+const HOURLY_WINDOW_HOURS = 48;
 
 export interface HourlyBucket {
   hour: string;
@@ -16,12 +18,23 @@ export interface DailyBucket {
 
 export interface KeyStats {
   keyId: number;
+  key: string;
   totalRequests: number;
   totalTokens: number;
   lastUsedAt: Date | null;
   hourly: HourlyBucket[];
   daily: DailyBucket[];
 }
+
+// ---------------------------------------------------------------------------
+// Retention cleanup
+// ---------------------------------------------------------------------------
+//
+// deleteOldRequests() moves per-request rows older than the retention window
+// into the daily-aggregate table. Previously this ran on *every* stats read,
+// which was by far the most expensive part of the endpoint (a full transaction
+// with scans, grouped aggregation, and N upserts). It now runs as a scheduled
+// background job (see `startRetentionCleanup`) and reads no longer block on it.
 
 export async function deleteOldRequests(): Promise<number> {
   const cutoffMs = Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -77,119 +90,201 @@ export async function deleteOldRequests(): Promise<number> {
   });
 }
 
+let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+let cleanupInFlight: Promise<unknown> | null = null;
+
+function runCleanupOnce(): Promise<unknown> {
+  if (cleanupInFlight) return cleanupInFlight;
+  cleanupInFlight = deleteOldRequests()
+    .catch((err) => {
+      console.error('Retention cleanup failed:', err);
+    })
+    .finally(() => {
+      cleanupInFlight = null;
+    });
+  return cleanupInFlight;
+}
+
+/**
+ * Start a periodic retention-cleanup job. Runs once at startup and then every
+ * `intervalMs` (default 5 minutes). Safe to call multiple times - subsequent
+ * calls are no-ops.
+ */
+export function startRetentionCleanup(intervalMs: number = 5 * 60 * 1000): void {
+  if (cleanupTimer) return;
+  // Kick off an initial run but don't block startup on it.
+  void runCleanupOnce();
+  cleanupTimer = setInterval(runCleanupOnce, intervalMs);
+  // Don't keep the event loop alive just for the cleanup timer.
+  cleanupTimer.unref?.();
+}
+
+export function stopRetentionCleanup(): void {
+  if (cleanupTimer) {
+    clearInterval(cleanupTimer);
+    cleanupTimer = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stats reads
+// ---------------------------------------------------------------------------
+
 export async function getKeyStatsByKey(keyString: string): Promise<KeyStats | null> {
-  await deleteOldRequests();
-  const apiKey = await prisma.apiKey.findUnique({
-    where: { key: keyString },
-    select: { id: true },
-  });
-  if (!apiKey) return null;
-  return getKeyStatsForId(apiKey.id);
+  const [stats] = await getKeysStatsByKeys([keyString]);
+  return stats ?? null;
 }
 
+/**
+ * Fetch stats for many keys in a constant number of DB round-trips
+ * (4 queries total, regardless of how many keys are requested).
+ *
+ * Keys that don't exist are simply omitted from the result.
+ */
 export async function getKeysStatsByKeys(keyStrings: string[]): Promise<KeyStats[]> {
-  await deleteOldRequests();
-  const stats: KeyStats[] = [];
-  for (const keyString of keyStrings) {
-    const apiKey = await prisma.apiKey.findUnique({
-      where: { key: keyString },
-      select: { id: true },
-    });
-    if (!apiKey) continue;
-    const s = await getKeyStatsForId(apiKey.id);
-    if (s) stats.push(s);
-  }
-  return stats;
-}
+  if (keyStrings.length === 0) return [];
 
-async function getKeyStatsForId(keyId: number): Promise<KeyStats | null> {
-  const apiKey = await prisma.apiKey.findUnique({
-    where: { id: keyId },
-    select: { id: true, lastUsedAt: true },
-  });
-  if (!apiKey) return null;
-
-  const cutoffMs = Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000;
-
-  const rows = await prisma.$queryRaw<
-    { hour: string; count: bigint; totalTokens: bigint }[]
-  >`
-    SELECT strftime('%Y-%m-%dT%H:00:00.000Z', createdAt / 1000, 'unixepoch') as hour,
-           COUNT(*) as count,
-           COALESCE(SUM(totalTokens), 0) as totalTokens
-    FROM ApiKeyRequest
-    WHERE apiKeyId = ${keyId} AND createdAt >= ${cutoffMs}
-    GROUP BY hour
-    ORDER BY hour
-  `;
-
-  const hourlyMap = new Map(
-    rows.map((r) => [r.hour, { count: Number(r.count), totalTokens: Number(r.totalTokens) }])
-  );
-
-  const hourly: HourlyBucket[] = [];
-  const now = new Date();
-  for (let i = 0; i < 48; i++) {
-    const h = new Date(now.getTime() - (47 - i) * 60 * 60 * 1000);
-    h.setMinutes(0, 0, 0);
-    const hourStr = h.toISOString();
-    const bucket = hourlyMap.get(hourStr);
-    hourly.push({
-      hour: hourStr,
-      count: bucket?.count ?? 0,
-      totalTokens: bucket?.totalTokens ?? 0,
-    });
-  }
-
-  // Aggregate recent requests (within retention window) by day
-  const recentDailyRows = await prisma.$queryRaw<
-    { date: string; count: bigint; totalTokens: bigint }[]
-  >`
-    SELECT strftime('%Y-%m-%d', createdAt / 1000, 'unixepoch') as date,
-           COUNT(*) as count,
-           COALESCE(SUM(totalTokens), 0) as totalTokens
-    FROM ApiKeyRequest
-    WHERE apiKeyId = ${keyId} AND createdAt >= ${cutoffMs}
-    GROUP BY date
-    ORDER BY date
-  `;
-
-  // Historical aggregated daily records (older than retention window)
-  const historicalDailyRows = await prisma.apiKeyUsageDaily.findMany({
-    where: { apiKeyId: keyId },
-    orderBy: { date: 'asc' },
-  });
-
-  // Merge: historical rows first, then recent rows (keyed by date to avoid duplicates)
-  const dailyMap = new Map<string, { count: number; totalTokens: number }>();
-  for (const r of historicalDailyRows) {
-    dailyMap.set(r.date, { count: r.count, totalTokens: r.totalTokens });
-  }
-  for (const r of recentDailyRows) {
-    const existing = dailyMap.get(r.date);
-    if (existing) {
-      dailyMap.set(r.date, {
-        count: existing.count + Number(r.count),
-        totalTokens: existing.totalTokens + Number(r.totalTokens),
-      });
-    } else {
-      dailyMap.set(r.date, { count: Number(r.count), totalTokens: Number(r.totalTokens) });
+  // De-duplicate while preserving input order so callers can correlate by position if they wish.
+  const seen = new Set<string>();
+  const uniqueKeys: string[] = [];
+  for (const k of keyStrings) {
+    if (!seen.has(k)) {
+      seen.add(k);
+      uniqueKeys.push(k);
     }
   }
 
-  const daily: DailyBucket[] = Array.from(dailyMap.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([date, { count, totalTokens }]) => ({ date, count, totalTokens }));
+  // 1) Resolve keys -> ids in one query
+  const apiKeys = await prisma.apiKey.findMany({
+    where: { key: { in: uniqueKeys } },
+    select: { id: true, key: true, lastUsedAt: true },
+  });
+  if (apiKeys.length === 0) return [];
 
-  const totalRequests = daily.reduce((sum, r) => sum + r.count, 0);
-  const totalTokens = daily.reduce((sum, r) => sum + r.totalTokens, 0);
+  const ids = apiKeys.map((k) => k.id);
+  const cutoffMs = Date.now() - STATS_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const idList = Prisma.join(ids);
 
-  return {
-    keyId: apiKey.id,
-    totalRequests,
-    totalTokens,
-    lastUsedAt: apiKey.lastUsedAt,
-    hourly,
-    daily,
-  };
+  // 2-4) Run the three aggregation queries in parallel
+  const [hourlyRows, recentDailyRows, historicalDailyRows] = await Promise.all([
+    prisma.$queryRaw<
+      { apiKeyId: number; hour: string; count: bigint; totalTokens: bigint }[]
+    >`
+      SELECT apiKeyId,
+             strftime('%Y-%m-%dT%H:00:00.000Z', createdAt / 1000, 'unixepoch') as hour,
+             COUNT(*) as count,
+             COALESCE(SUM(totalTokens), 0) as totalTokens
+      FROM ApiKeyRequest
+      WHERE apiKeyId IN (${idList}) AND createdAt >= ${cutoffMs}
+      GROUP BY apiKeyId, hour
+    `,
+    prisma.$queryRaw<
+      { apiKeyId: number; date: string; count: bigint; totalTokens: bigint }[]
+    >`
+      SELECT apiKeyId,
+             strftime('%Y-%m-%d', createdAt / 1000, 'unixepoch') as date,
+             COUNT(*) as count,
+             COALESCE(SUM(totalTokens), 0) as totalTokens
+      FROM ApiKeyRequest
+      WHERE apiKeyId IN (${idList}) AND createdAt >= ${cutoffMs}
+      GROUP BY apiKeyId, date
+    `,
+    prisma.apiKeyUsageDaily.findMany({
+      where: { apiKeyId: { in: ids } },
+      select: { apiKeyId: true, date: true, count: true, totalTokens: true },
+    }),
+  ]);
+
+  // Index rows by apiKeyId for O(1) per-key lookup
+  const hourlyByKey = new Map<number, Map<string, { count: number; totalTokens: number }>>();
+  for (const r of hourlyRows) {
+    let m = hourlyByKey.get(r.apiKeyId);
+    if (!m) {
+      m = new Map();
+      hourlyByKey.set(r.apiKeyId, m);
+    }
+    m.set(r.hour, { count: Number(r.count), totalTokens: Number(r.totalTokens) });
+  }
+
+  const dailyByKey = new Map<number, Map<string, { count: number; totalTokens: number }>>();
+  for (const r of historicalDailyRows) {
+    let m = dailyByKey.get(r.apiKeyId);
+    if (!m) {
+      m = new Map();
+      dailyByKey.set(r.apiKeyId, m);
+    }
+    m.set(r.date, { count: r.count, totalTokens: r.totalTokens });
+  }
+  for (const r of recentDailyRows) {
+    let m = dailyByKey.get(r.apiKeyId);
+    if (!m) {
+      m = new Map();
+      dailyByKey.set(r.apiKeyId, m);
+    }
+    const existing = m.get(r.date);
+    const count = Number(r.count);
+    const totalTokens = Number(r.totalTokens);
+    if (existing) {
+      m.set(r.date, {
+        count: existing.count + count,
+        totalTokens: existing.totalTokens + totalTokens,
+      });
+    } else {
+      m.set(r.date, { count, totalTokens });
+    }
+  }
+
+  // Pre-compute the hourly calendar once (identical across all keys in this response).
+  const now = new Date();
+  const hourTemplate: string[] = [];
+  for (let i = 0; i < HOURLY_WINDOW_HOURS; i++) {
+    const h = new Date(now.getTime() - (HOURLY_WINDOW_HOURS - 1 - i) * 60 * 60 * 1000);
+    h.setMinutes(0, 0, 0);
+    hourTemplate.push(h.toISOString());
+  }
+
+  // Preserve input order for the response.
+  const byKeyString = new Map(apiKeys.map((k) => [k.key, k]));
+  const result: KeyStats[] = [];
+
+  for (const keyString of uniqueKeys) {
+    const apiKey = byKeyString.get(keyString);
+    if (!apiKey) continue;
+
+    const hourlyMap = hourlyByKey.get(apiKey.id);
+    const hourly: HourlyBucket[] = hourTemplate.map((hour) => {
+      const bucket = hourlyMap?.get(hour);
+      return {
+        hour,
+        count: bucket?.count ?? 0,
+        totalTokens: bucket?.totalTokens ?? 0,
+      };
+    });
+
+    const dailyMap = dailyByKey.get(apiKey.id);
+    const daily: DailyBucket[] = dailyMap
+      ? Array.from(dailyMap.entries())
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([date, { count, totalTokens }]) => ({ date, count, totalTokens }))
+      : [];
+
+    let totalRequests = 0;
+    let totalTokens = 0;
+    for (const d of daily) {
+      totalRequests += d.count;
+      totalTokens += d.totalTokens;
+    }
+
+    result.push({
+      keyId: apiKey.id,
+      key: apiKey.key,
+      totalRequests,
+      totalTokens,
+      lastUsedAt: apiKey.lastUsedAt,
+      hourly,
+      daily,
+    });
+  }
+
+  return result;
 }

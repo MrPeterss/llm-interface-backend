@@ -5,6 +5,7 @@ import { prisma } from './prisma.js';
 import { chatRouter } from './chat/chatRouter.js';
 import { keysRouter } from './keys/keysRouter.js';
 import { statsRouter } from './stats/statsRouter.js';
+import { startRetentionCleanup, stopRetentionCleanup } from './stats/statsService.js';
 
 const app = express();
 
@@ -34,6 +35,7 @@ const server = app.listen(port, async () => {
   try {
     await prisma.$connect();
     console.log('Database connected successfully');
+    startRetentionCleanup();
   } catch (error) {
     console.error('Failed to connect to database:', error);
     process.exit(1);
@@ -42,6 +44,7 @@ const server = app.listen(port, async () => {
 
 const gracefulShutdown = async () => {
   console.log('Shutting down gracefully...');
+  stopRetentionCleanup();
 
   server.close(async () => {
     console.log('HTTP server closed');

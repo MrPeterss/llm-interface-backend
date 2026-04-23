@@ -24,29 +24,33 @@ export async function issueKeys(
   limits: KeyLimits = {},
   origin?: string | null
 ): Promise<IssuedKey[]> {
-  const keys = await Promise.all(
-    descriptions.map(async (description) => {
-      const key = generateApiKey();
-      const apiKey = await prisma.apiKey.create({
-        data: {
-          key,
-          description: description || 'No description',
-          origin: origin ?? null,
-          limitTokensPerMinute: limits.limitTokensPerMinute ?? null,
-          limitTokensPerHour: limits.limitTokensPerHour ?? null,
-        },
-      });
-      return {
-        id: apiKey.id,
-        key: apiKey.key,
-        description: apiKey.description,
-        origin: apiKey.origin,
-        limitTokensPerMinute: apiKey.limitTokensPerMinute,
-        limitTokensPerHour: apiKey.limitTokensPerHour,
-      };
-    })
-  );
-  return keys;
+  const pairs = descriptions.map((description) => ({
+    key: generateApiKey(),
+    description: description || 'No description',
+    origin: origin ?? null,
+    limitTokensPerMinute: limits.limitTokensPerMinute ?? null,
+    limitTokensPerHour: limits.limitTokensPerHour ?? null,
+  }));
+
+  const generatedKeyStrings = pairs.map((p) => p.key);
+
+  // createMany is one round-trip to the DB regardless of how many keys are
+  // being issued. Prisma/SQLite doesn't support createManyAndReturn yet, so
+  // we fetch the inserted rows with a follow-up findMany.
+  await prisma.apiKey.createMany({ data: pairs });
+
+  return prisma.apiKey.findMany({
+    where: { key: { in: generatedKeyStrings } },
+    select: {
+      id: true,
+      key: true,
+      description: true,
+      origin: true,
+      limitTokensPerMinute: true,
+      limitTokensPerHour: true,
+    },
+    orderBy: { id: 'asc' },
+  });
 }
 
 export interface KeyInfo {
